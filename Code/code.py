@@ -142,6 +142,13 @@ results_df = pd.DataFrame(results).T  # Transpose so models are rows
 results_df = results_df.reset_index()  # Reset index to create a column for models
 results_df = results_df.melt(id_vars="index", var_name="Metric", value_name="Score")  # Reshape for plotting
 
+# Display the table
+print("Model Performance Comparison:")
+print(results_df)
+
+# Save the table to a CSV file if needed
+results_df.to_csv('model_performance_comparison.csv', index=True)
+
 # Plotting
 plt.figure(figsize=(12, 8))
 
