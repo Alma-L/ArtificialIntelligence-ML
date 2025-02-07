@@ -1,17 +1,17 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
 import lightgbm as lgb
 import catboost as cb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import joblib
-from scipy.stats import randint
+from sklearn.preprocessing import LabelEncoder
+from sklearn.impute import SimpleImputer
 
-# Load dataset (You may want to load only a sample for faster experimentation)
+# Load dataset
 df = pd.read_csv("Data/flightdata.csv", dtype={
     'from_airport_code': 'category',
     'dest_airport_code': 'category',
@@ -19,128 +19,162 @@ df = pd.read_csv("Data/flightdata.csv", dtype={
     'dest_country': 'category',
     'airline_name': 'category',
     'aircraft_type': 'category',
-    'currency': 'category'
+    'currency': 'category',
+    'price': np.float64,  # Ensure price is numeric
+    'co2_percentage': 'str',  # Keep as string initially for cleaning
+    'departure_time': 'str',  # Keep as string to process later
+    'arrival_time': 'str',
+    'scan_date': 'str'
 })
 
-# Step 1: Clean 'aircraft_type' (and similar columns)
+# Drop columns that aren't needed for the model
+df.drop(columns=["from_country", "dest_country", "currency", "scan_date"], inplace=True)
+
+# Clean 'aircraft_type' and similar columns, splitting any combined categories
 df["aircraft_type"] = df["aircraft_type"].str.split('|').str[0]
 
-# Step 2: Remove duplicate rows
+# Remove duplicate rows
 df.drop_duplicates(inplace=True)
 
-# Step 3: Label Encoding for categorical columns efficiently
-categorical_columns = ["from_airport_code", "dest_airport_code", "from_country", "dest_country",
-                       "airline_name", "aircraft_type", "currency"]
+# Label Encoding for categorical columns efficiently
+categorical_columns = ["from_airport_code", "dest_airport_code", "airline_name", "aircraft_type"]
+label_encoder = LabelEncoder()
 for col in categorical_columns:
-    df[col] = LabelEncoder().fit_transform(df[col].astype(str))  # Label encode all columns
+    df[col] = label_encoder.fit_transform(df[col])
 
-# Step 4: Handle 'co2_percentage' column and ensure numeric types
+# Clean 'co2_percentage' and ensure numeric types
 df["co2_percentage"] = df["co2_percentage"].replace({"None%": None, "nan": None, "": None, "None": None})
 df["co2_percentage"] = df["co2_percentage"].str.replace('%', '', regex=True).astype(float)
-df["co2_percentage"] = df["co2_percentage"].fillna(df["co2_percentage"].median())  # Avoid inplace
+df["co2_percentage"].fillna(df["co2_percentage"].median())  # Fixed FutureWarning
 
-# Step 5: Convert datetime columns to timestamp (seconds since the epoch)
-df["departure_time"] = pd.to_datetime(df["departure_time"], errors='coerce')
-df["arrival_time"] = pd.to_datetime(df["arrival_time"], errors='coerce')
-df["scan_date"] = pd.to_datetime(df["scan_date"], errors='coerce')
+# Convert datetime columns to timestamps
+df["departure_time"] = pd.to_datetime(df["departure_time"], errors='coerce').astype('int64') // 10 ** 9
+df["arrival_time"] = pd.to_datetime(df["arrival_time"], errors='coerce').astype('int64') // 10 ** 9
 
-df["departure_time"] = df["departure_time"].astype('int64') // 10 ** 9
-df["arrival_time"] = df["arrival_time"].astype('int64') // 10 ** 9
-df["scan_date"] = df["scan_date"].astype('int64') // 10 ** 9
+# Handle missing values for 'price' column directly
+df["price"] = df["price"].fillna(df["price"].median())
 
-# Step 6: Handle missing values and outliers
-# Fill missing values in numeric columns
-df.fillna(df.median(numeric_only=True), inplace=True)
-
-# Handle outliers using IQR for 'price'
+# Handle outliers using IQR for the price column
 Q1 = df["price"].quantile(0.25)
 Q3 = df["price"].quantile(0.75)
 IQR = Q3 - Q1
 df = df[(df["price"] >= Q1 - 1.5 * IQR) & (df["price"] <= Q3 + 1.5 * IQR)]
 
-# Step 7: Prepare features (X) and target variable (y)
-X = df.drop(columns=["price"])  # Drop the target column
-y = df["price"]
+# Separate features (X) and target variable (y)
+X = df.drop(columns=["price"])  # Features
+y = df["price"]  # Target variable
 
-# Convert all columns to numeric
-X = X.apply(pd.to_numeric, errors='coerce')
+# Handle missing values in X using SimpleImputer
+numeric_columns = X.select_dtypes(include=[np.number]).columns
+imputer = SimpleImputer(strategy='median')
+X[numeric_columns] = imputer.fit_transform(X[numeric_columns])
 
-# Step 8: Replace infinite values with NaN and fill them with median
-X.replace([np.inf, -np.inf], np.nan, inplace=True)
-X.fillna(X.median(), inplace=True)
+# Apply imputation for categorical columns (if any)
+non_numeric_columns = X.select_dtypes(exclude=[np.number]).columns
+categorical_imputer = SimpleImputer(strategy='most_frequent')
+X[non_numeric_columns] = categorical_imputer.fit_transform(X[non_numeric_columns])
 
-# Step 9: Handle large values (cap them at 1e10 or smaller than -1e10)
-X[X > 1e10] = 1e10
-X[X < -1e10] = -1e10
+# Replace any non-numeric values in X (like 'multi') with NaN and then impute them
+X = X.apply(pd.to_numeric, errors='coerce')  # Convert all columns to numeric (non-numeric becomes NaN)
+X.fillna(X.median(), inplace=True)  # Impute NaN values with the column median
 
-# Step 10: Split the data into training and testing sets
+# **Fixing large values and infinities**
+# Clip large values to a reasonable range (e.g., 1e10)
+X = X.clip(-1e10, 1e10)
+
+# Handle NaN values in target variable 'y'
+y = y.fillna(y.median())  # Impute the target variable if any NaN exists
+
+# **Fix any infinity or large values in y**
+y = np.clip(y, -1e10, 1e10)
+
+# Split the data into training and testing sets
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Step 11: Hyperparameter tuning using RandomizedSearchCV for Random Forest
-param_grid = {
-    'n_estimators': randint(100, 200),  # Reduced search space
-    'max_depth': [10, 20, None],
-    'min_samples_split': randint(2, 6),  # Reduced search space
-    'min_samples_leaf': randint(1, 4),
-    'bootstrap': [True, False]
-}
-
-rf = RandomForestRegressor(random_state=42)
-random_search = RandomizedSearchCV(estimator=rf, param_distributions=param_grid, n_iter=3, cv=2, n_jobs=-1, verbose=2)  # Reduced n_iter and cv
-
-# Handle cases where fits fail
-try:
-    random_search.fit(X_train, y_train)
-except ValueError as e:
-    print(f"ValueError: {e}. Check if there are any non-numeric or infinite values in your data.")
-    print("Cleaning the dataset and re-running the fitting process.")
-    # You can add any additional handling or retry logic here
-
-# Get the best parameters and model
-best_rf_model = random_search.best_estimator_
-
-# Step 12: Define models to train (with tuned RandomForest)
-models = {
-    "Random Forest": best_rf_model,
-    "XGBoost": XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42),
-    "LightGBM": lgb.LGBMRegressor(n_estimators=100, random_state=42),
-    "CatBoost": cb.CatBoostRegressor(iterations=100, depth=6, learning_rate=0.1, verbose=False)
-}
-
-# Step 13: Train and evaluate models
+# Prepare a dictionary to store results
 results = {}
-for name, model in models.items():
-    try:
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        r2 = r2_score(y_test, y_pred)
-        results[name] = {"MAE": mae, "RMSE": rmse, "R²": r2}
-        print(f"🔹 {name} Performance: MAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.2f}")
-    except ValueError as e:
-        print(f"Error during fitting model {name}: {e}")
 
-# Step 14: Convert results to DataFrame for visualization
-results_df = pd.DataFrame(results).T
-results_df = results_df.reset_index().melt(id_vars="index", var_name="Metric", value_name="Score")
-results_df.rename(columns={"index": "Model"}, inplace=True)
+# --- RandomForest ---
+rf = RandomForestRegressor(random_state=42, n_jobs=-1)
+rf.fit(X_train, y_train)
+y_pred_rf = rf.predict(X_test)
+mae_rf = mean_absolute_error(y_test, y_pred_rf)
+rmse_rf = np.sqrt(mean_squared_error(y_test, y_pred_rf))
+r2_rf = r2_score(y_test, y_pred_rf)
+results["Random Forest"] = {"MAE": mae_rf, "RMSE": rmse_rf, "R²": r2_rf}
 
-# Step 15: Visualization of Model Performance
-fig, ax = plt.subplots(figsize=(10, 6))
 
-# Create a bar plot using matplotlib
-for metric in results_df['Metric'].unique():
-    subset = results_df[results_df['Metric'] == metric]
-    ax.bar(subset['Model'], subset['Score'], label=metric)
+# --- XGBoost ---
+xgb_model = XGBRegressor(n_estimators=50, random_state=42, tree_method='hist', n_jobs=-1)
+xgb_model.fit(X_train, y_train)
+y_pred_xgb = xgb_model.predict(X_test)
+mae_xgb = mean_absolute_error(y_test, y_pred_xgb)
+rmse_xgb = np.sqrt(mean_squared_error(y_test, y_pred_xgb))
+r2_xgb = r2_score(y_test, y_pred_xgb)
+results["XGBoost"] = {"MAE": mae_xgb, "RMSE": rmse_xgb, "R²": r2_xgb}
 
-ax.set_title("Model Performance Comparison")
-ax.set_xlabel("Algorithms")
-ax.set_ylabel("Score")
-ax.legend(title="Metrics")
-plt.xticks(rotation=45)
+# --- LightGBM ---
+lgb_model = lgb.LGBMRegressor(n_estimators=50, random_state=42, device='gpu', n_jobs=-1)
+lgb_model.fit(X_train, y_train)
+y_pred_lgb = lgb_model.predict(X_test)
+mae_lgb = mean_absolute_error(y_test, y_pred_lgb)
+rmse_lgb = np.sqrt(mean_squared_error(y_test, y_pred_lgb))
+r2_lgb = r2_score(y_test, y_pred_lgb)
+results["LightGBM"] = {"MAE": mae_lgb, "RMSE": rmse_lgb, "R²": r2_lgb}
+
+# --- CatBoost ---
+cb_model = cb.CatBoostRegressor(iterations=50, depth=6, learning_rate=0.1, verbose=False, task_type='CPU')
+cb_model.fit(X_train, y_train)
+y_pred_cb = cb_model.predict(X_test)
+mae_cb = mean_absolute_error(y_test, y_pred_cb)
+rmse_cb = np.sqrt(mean_squared_error(y_test, y_pred_cb))
+r2_cb = r2_score(y_test, y_pred_cb)
+results["CatBoost"] = {"MAE": mae_cb, "RMSE": rmse_cb, "R²": r2_cb}
+
+# Save models
+joblib.dump(rf, 'random_forest_model.pkl')
+joblib.dump(xgb_model, 'xgboost_model.pkl')
+joblib.dump(lgb_model, 'lightgbm_model.pkl')
+joblib.dump(cb_model, 'catboost_model.pkl')
+
+# Convert the results dictionary to a DataFrame
+results_df = pd.DataFrame(results).T  # Transpose so models are rows
+results_df = results_df.reset_index()  # Reset index to create a column for models
+results_df = results_df.melt(id_vars="index", var_name="Metric", value_name="Score")  # Reshape for plotting
+
+# Plotting
+plt.figure(figsize=(12, 8))
+
+# Define colors for each metric
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Blue for MAE, Orange for RMSE, Green for R²
+
+# Bar width
+bar_width = 0.25
+# Positioning of bars
+position = range(len(results_df['index'].unique()))
+
+# Plot bars for each metric
+for i, metric in enumerate(results_df['Metric'].unique()):
+    data = results_df[results_df['Metric'] == metric]
+    plt.bar([p + i * bar_width for p in position], data['Score'], width=bar_width, label=metric, color=colors[i])
+
+# Customize the plot
+plt.title("Model Performance Comparison", fontsize=16)
+plt.xlabel("Algorithms", fontsize=14)
+plt.ylabel("Score", fontsize=14)
+plt.xticks([p + bar_width for p in position], results_df['index'].unique(), rotation=45, fontsize=12)
+plt.legend(title="Metrics", loc='upper left')
+
+# Add value annotations to bars
+for i, metric in enumerate(results_df['Metric'].unique()):
+    for j, value in enumerate(results_df[results_df['Metric'] == metric]['Score']):
+        plt.text(position[j] + i * bar_width, value + 10, f'{value:.2f}', ha='center', va='bottom', fontsize=10)
+
+# Tight layout to prevent clipping
 plt.tight_layout()
-plt.show()
 
-# Step 16: Save the best model (RandomForest)
-joblib.dump(best_rf_model, 'best_rf_model.pkl')
+# Save the plot to a PNG file
+plt.savefig("results_comparison.png")
+plt.close()
+
+print("Model comparison plot saved as model_comparison.png")
